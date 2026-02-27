@@ -1,0 +1,217 @@
+import tkinter as tk
+from PIL import Image, ImageTk
+import threading
+import queue
+import sounddevice as sd
+import vosk
+import json
+import pyttsx3
+import os
+from playsound import playsound
+
+from parking_assistant import ParkingAssistant
+
+assistant = ParkingAssistant()
+
+# GUI code calls assistant.reserve_spot(), assistant.process_command(), etc.
+
+# === SETTINGS ===
+ASSISTANT_NAME = "hannah"
+NUM_SPOTS = 4
+spots = {i: "available" for i in range(1, NUM_SPOTS + 1)}
+
+# === GLOBALS ===
+last_referenced_spot = None
+is_speaking = False
+q = queue.Queue()
+
+# === VOSK SETUP ===
+if not os.path.exists("model"):
+    print("Please download a Vosk model and place it in a folder named 'model'")
+    exit(1)
+
+model = vosk.Model("model")
+recognizer = vosk.KaldiRecognizer(model, 16000)
+
+# === TEXT TO SPEECH ===
+engine = pyttsx3.init()
+engine.setProperty('voice', engine.getProperty('voices')[0].id)
+
+from gtts import gTTS
+import tempfile
+
+from gtts import gTTS
+import tempfile
+import os
+import uuid
+
+from gtts import gTTS
+import tempfile
+import os
+import uuid
+import pygame
+
+def speak(text):
+    global is_speaking
+
+    def run_tts():
+        global is_speaking
+        is_speaking = True
+        print(f"{ASSISTANT_NAME}: {text}")
+        try:
+            tts = gTTS(text)
+            temp_filename = os.path.join(tempfile.gettempdir(), f"tts_{uuid.uuid4()}.mp3")
+            tts.save(temp_filename)
+
+            # Initialize and play using pygame
+            pygame.mixer.init()
+            pygame.mixer.music.load(temp_filename)
+            pygame.mixer.music.play()
+
+            while pygame.mixer.music.get_busy():
+                continue  # Wait until speech finishes
+
+            pygame.mixer.quit()
+            os.remove(temp_filename)
+
+        except Exception as e:
+            print("TTS error:", e)
+        is_speaking = False
+
+    threading.Thread(target=run_tts, daemon=True).start()
+
+# === GUI CLASS ===
+class SmartParkingGUI:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Smart Parking Assistant")
+        self.master.geometry("800x500")
+
+        self.car_img = ImageTk.PhotoImage(Image.open("car.png").resize((100, 100)))
+        self.empty_img = ImageTk.PhotoImage(Image.open("empty.jpg").resize((100, 100)))
+
+        self.spot_frame = tk.Frame(master)
+        self.spot_frame.pack(pady=20)
+
+        self.spot_labels = {}
+        for i in range(1, NUM_SPOTS + 1):
+            spot_container = tk.Frame(self.spot_frame)
+            spot_container.grid(row=0, column=i-1, padx=15)
+
+            label = tk.Label(spot_container, image=self.empty_img, text=f"Spot {i}", compound="top", bd=2, relief="ridge")
+            label.pack()
+            self.spot_labels[i] = label
+
+            # Buttons for reserve/cancel/check
+            tk.Button(spot_container, text="Reserve", command=lambda i=i: self.reserve_spot(i)).pack(pady=2)
+            tk.Button(spot_container, text="Cancel", command=lambda i=i: self.cancel_spot(i)).pack(pady=2)
+            tk.Button(spot_container, text="Check", command=lambda i=i: self.check_spot(i)).pack(pady=2)
+
+        # Listen button
+        self.listen_button = tk.Button(master, text="🎤 Start Listening", command=self.start_listening_thread)
+        self.listen_button.pack(pady=10)
+
+        self.status_label = tk.Label(master, text="You can click buttons or speak your command.")
+        self.status_label.pack()
+
+        self.update_spots()
+
+    def update_spots(self):
+        for i in range(1, NUM_SPOTS + 1):
+            image = self.car_img if spots[i] == "reserved" else self.empty_img
+            self.spot_labels[i].configure(image=image)
+            self.spot_labels[i].image = image
+
+    # Manual control buttons
+    def reserve_spot(self, spot):
+        global last_referenced_spot
+        if spots[spot] == "available":
+            spots[spot] = "reserved"
+            last_referenced_spot = spot
+            speak(f"Spot {spot} has been reserved.")
+        else:
+            speak(f"Spot {spot} is already reserved.")
+        self.update_spots()
+
+    def cancel_spot(self, spot):
+        if spots[spot] == "reserved":
+            spots[spot] = "available"
+            speak(f"Reservation for spot {spot} has been canceled.")
+        else:
+            speak(f"Spot {spot} is not reserved.")
+        self.update_spots()
+
+    def check_spot(self, spot):
+        status = spots[spot]
+        speak(f"Spot {spot} is {status}.")
+
+    # === Voice Listening ===
+    def start_listening_thread(self):
+        threading.Thread(target=self.listen_loop, daemon=True).start()
+
+    def listen_loop(self):
+        try:
+            playsound("chime.wav")
+        except:
+            pass
+        speak("How can I help you with parking?")
+
+        with sd.RawInputStream(samplerate=16000, blocksize=8000, dtype='int16',
+                               channels=1, callback=self.audio_callback):
+            while True:
+                data = q.get()
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+                    text = result.get("text", "")
+                    if text:
+                        print("You said:", text)
+                        self.process_command(text)
+                        self.update_spots()
+
+    def audio_callback(self, indata, frames, time_info, status):
+        if status:
+            print(status)
+        if not is_speaking:
+            q.put(bytes(indata))
+
+    def process_command(self, command):
+        global last_referenced_spot
+        command = command.lower()
+        spot = self.extract_spot_number(command)
+
+        if "reserve" in command and spot:
+            self.reserve_spot(spot)
+        elif "cancel" in command and spot:
+            self.cancel_spot(spot)
+        elif "available" in command and spot:
+            self.check_spot(spot)
+        elif "available" in command:
+            available = [str(s) for s, stat in spots.items() if stat == "available"]
+            if available:
+                speak(f"Available spots are: {', '.join(available)}.")
+            else:
+                speak("No spots are available.")
+        elif "exit" in command or "quit" in command:
+            speak("Goodbye!")
+            self.master.quit()
+        else:
+            speak("Sorry, I didn't understand the command.")
+
+    def extract_spot_number(self, command):
+        words = command.lower().split()
+        number_words = {
+        "zero": 0, "one": 1, "two": 2, "to": 2, "too": 2, 
+        "three": 3, "four": 4, "for": 4,"before": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "ate": 8, "nine": 9, "ten": 10,
+        "1": 1, "2": 2, "3": 3, "4": 4
+        }
+        for word in words:
+            if word in number_words:
+                return number_words[word]
+        return None
+
+# === RUN GUI ===
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SmartParkingGUI(root)
+    root.mainloop()

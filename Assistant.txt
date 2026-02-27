@@ -1,0 +1,322 @@
+import queue
+import sounddevice as sd
+import vosk
+import sys
+import json
+import pyttsx3
+import time
+from playsound import playsound
+
+ASSISTANT_NAME = "hannah"
+last_referenced_spot = None
+
+is_speaking = False
+
+# Parking spot tracking
+NUM_SPOTS = 4
+spots = {i: "available" for i in range(1, NUM_SPOTS + 1)}
+
+number_words = {
+    "zero": 0, "one": 1, "two": 2, "to": 2, "too": 2, 
+    "three": 3, "four": 4, "for": 4,"before": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "ate": 8, "nine": 9, "ten": 10
+}
+spot_synonyms = ["spot", "spart", "part", "pot", "his part", "support", "slot", "despite","sport"]
+
+cancel_keywords = ["cancel", "remove", "council", "councillor", "call sir", "caller"]
+reserve_keywords = ["reserve", "reservation", "book", "booking"]
+
+ordinal_words = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+}
+
+# Initialize TTS engine
+def speak(text):
+    global is_speaking
+    is_speaking = True
+    print("Assistant:", text)
+    engine = pyttsx3.init()
+
+    voices = engine.getProperty('voices')
+    engine.setProperty('voice', voices[1].id)  # change index to your chosen female voice
+
+    engine.say(text)
+    engine.runAndWait()
+    engine.stop()
+    time.sleep(0.5)
+    is_speaking = False
+
+# Load Vosk model
+model = vosk.Model("model")
+recognizer = vosk.KaldiRecognizer(model, 16000)
+q = queue.Queue()
+
+# Audio callback
+def callback(indata, frames, time_info, status):
+    if status:
+        print(status, file=sys.stderr)
+    if not is_speaking:
+        q.put(bytes(indata))
+
+
+# Smart Parking functions
+def check_availability():
+    speak("There are 4 parking spots available.")
+
+def reserve_spot():
+    speak("Your parking spot has been reserved.")
+
+def cancel_reservation():
+    speak("Your reservation has been canceled.")
+
+def show_parking_fee():
+    speak("The parking fee is 20 rupees per hour.")
+
+def exit_assistant():
+    speak("Exiting. Have a great day!")
+    sys.exit(0)
+
+def is_single_spot_mention(command):
+    """Returns the spot number if the entire command is just a number or number word."""
+    word = command.strip().lower()
+    if word.isdigit():
+        num = int(word)
+        if 1 <= num <= NUM_SPOTS:
+            return num
+    elif word in number_words:
+        num = number_words[word]
+        if 1 <= num <= NUM_SPOTS:
+            return num
+    return None
+
+# Process voice command
+def process_command(command):
+    command = command.lower().strip()
+
+    # --- ADDITION: handle single-word number commands like "one", "five", "2" ---
+    spot_num = is_single_spot_mention(command)
+    if spot_num:
+        speak(f"You said spot {spot_num}. Do you want to reserve it, check availability, or cancel a reservation?")
+        return
+    # --- END ADDITION ---
+
+    # Cancel reservation (put early to avoid conflicts with "hi" or "hello")
+    if any(word in command for word in cancel_keywords):
+        cancel_specific_reservation(command)
+
+    elif any(word in command for word in reserve_keywords) and any(pronoun in command for pronoun in ["it", "that", "this"]):
+        if last_referenced_spot:
+            reserve_specific_spot(str(last_referenced_spot))
+        else:
+            speak("Please specify which spot you'd like to reserve.")
+    elif any(word in command for word in reserve_keywords):
+        reserve_specific_spot(command)
+
+    
+    elif ("available" in command or "availability" in command) and any(syn in command for syn in spot_synonyms):
+        spot_num = extract_spot_number(command)
+        if spot_num:
+            check_specific_spot(spot_num)
+        else:
+            speak("Please specify a valid spot number to check availability.")
+
+    # General parking availability — put BEFORE specific spot check!
+    elif "available" in command or "availability" in command or "any spot" in command or "free space" in command:
+        check_all_availability()
+
+    elif any(word in command for word in reserve_keywords):
+        reserve_specific_spot(command)
+
+    elif any(word in command for word in reserve_keywords) and ("it" in command or "that" in command or "this" in command):
+        if last_referenced_spot:
+            reserve_specific_spot(str(last_referenced_spot))
+        else:
+            speak("Please specify which spot you'd like to reserve.")
+
+
+    # Check specific spot availability
+    elif ("available" in command or "availability" in command) and any(syn in command for syn in spot_synonyms):
+        spot_num = extract_spot_number(command)
+        if spot_num:
+            check_specific_spot(spot_num)
+        else:
+            speak("Please specify a valid spot number to check availability.")
+
+    # Show fee
+    elif "fee" in command or "cost" in command or "price" in command:
+        show_parking_fee()
+
+    # Assistant info
+    if any(phrase in command for phrase in ["your name", "who are you", "what is your name", "tell me your name"]):
+        speak(f"My name is {ASSISTANT_NAME}. I am your smart parking assistant.")
+
+    # Greeting
+    elif "hello" in command or "hi" in command:
+        speak(f"My name is {ASSISTANT_NAME}. Hello! How can I help you?")
+
+    # Exit
+    elif "exit" in command or "quit" in command:
+        exit_assistant()
+
+    else:
+        speak("Sorry, I didn't understand that command.")
+
+def extract_spot_number(command):
+    # First, check digits in command
+    for token in command.split():
+        if token.isdigit():
+            num = int(token)
+            if 1 <= num <= NUM_SPOTS:
+                return num
+    
+    # If no digits, check number words
+    for word, num in number_words.items():
+        if word in command:
+            if 1 <= num <= NUM_SPOTS:
+                return num
+
+    # Check ordinal words
+    for word, num in ordinal_words.items():
+        if word in command:
+            if 1 <= num <= NUM_SPOTS:
+                return num
+
+    return None
+
+
+# Start listening
+def listen():
+    with sd.RawInputStream(samplerate=16000, blocksize=8000, dtype='int16',
+                           channels=1, callback=callback):
+        print("🎤 Assistant is listening. Say something...")
+        speak("How can I help you with parking?")
+        playsound("chime.wav")
+        while True:
+            data = q.get()
+            if recognizer.AcceptWaveform(data):
+                result = recognizer.Result()
+                text = json.loads(result).get("text", "")
+                if text:
+                    print("You said:", text)
+                    process_command(text)
+
+import re
+
+def get_spot_number_from_command(command):
+    words = command.lower().split()
+
+    # Spot + number pattern
+    for i, word in enumerate(words):
+        if word in spot_synonyms and i + 1 < len(words):
+            next_word = words[i + 1]
+            if next_word.isdigit():
+                return int(next_word)
+            elif next_word in number_words:
+                return number_words[next_word]
+            elif next_word in ordinal_words:
+                return ordinal_words[next_word]
+
+    # Fallback: any single valid number/word
+    for word in words:
+        if word.isdigit():
+            num = int(word)
+            if 1 <= num <= NUM_SPOTS:
+                return num
+        elif word in number_words:
+            num = number_words[word]
+            if 1 <= num <= NUM_SPOTS:
+                return num
+        elif word in ordinal_words:
+            num = ordinal_words[word]
+            if 1 <= num <= NUM_SPOTS:
+                return num
+
+    return None
+
+
+    # Fallback: if there's a single number, number word, or ordinal word anywhere in command
+    for word in words:
+        if word.isdigit() and 1 <= int(word) <= NUM_SPOTS:
+            return int(word)
+        elif word in number_words:
+            num = number_words[word]
+            if 1 <= num <= NUM_SPOTS:
+                return num
+        elif word in ordinal_words:
+            num = ordinal_words[word]
+            if 1 <= num <= NUM_SPOTS:
+                return num
+
+    return None
+
+    # Fallback: if there's a single number and the command includes a reservation or cancellation word
+    for word in words:
+        if word.isdigit() and 1 <= int(word) <= NUM_SPOTS:
+            return int(word)
+        elif word in number_words:
+            num = number_words[word]
+            if 1 <= num <= NUM_SPOTS:
+                return num
+
+    return None
+
+
+    return None
+def reserve_specific_spot(command):
+    global last_referenced_spot
+    spot = get_spot_number_from_command(command)
+    
+    if spot and 1 <= spot <= NUM_SPOTS:
+        last_referenced_spot = spot  # ✅ Remember the last mentioned spot
+
+        if spots[spot] == "available":
+            spots[spot] = "reserved"
+            speak(f"Spot {spot} has been reserved for you.")
+        else:
+            speak(f"Sorry, spot {spot} is already {spots[spot]}.")
+    else:
+        speak(f"Please specify a valid spot number between 1 and {NUM_SPOTS}.")
+
+
+def check_specific_spot(spot):
+    global last_referenced_spot
+    if 1 <= spot <= NUM_SPOTS:
+        last_referenced_spot = spot  # 👈 store it for later use
+        status = spots.get(spot)
+        if status == "available":
+            speak(f"Yes, spot {spot} is available.")
+        else:
+            speak(f"No, spot {spot} is already reserved.")
+    else:
+        speak(f"Please specify a valid spot number between 1 and {NUM_SPOTS}.")
+
+def cancel_specific_reservation(command):
+    spot = get_spot_number_from_command(command)
+    if spot and 1 <= spot <= NUM_SPOTS:
+        if spots[spot] == "reserved":
+            spots[spot] = "available"
+            speak(f"Your reservation for spot {spot} has been canceled.")
+        else:
+            speak(f"Spot {spot} is not currently reserved.")
+    else:
+        speak("Please specify a valid spot number between 1 and 4.")
+
+def check_all_availability():
+    available = [str(spot) for spot, status in spots.items() if status == "available"]
+    if available:
+        speak(f"The following spots are available: {', '.join(available)}.")
+    else:
+        speak("Sorry, there are no available spots right now.")
+
+# Start assistant
+if __name__ == "__main__":
+    listen()
+
+from parking_assistant import ParkingAssistant
+
+assistant = ParkingAssistant()
+
+# existing code...
